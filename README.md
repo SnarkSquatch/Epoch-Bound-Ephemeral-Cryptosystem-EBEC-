@@ -11,13 +11,16 @@ EBEC uses an ephemeral X25519 key exchange to establish a shared session root se
 ## Core Features
 
 * **Ephemeral Key Exchange:** Uses ephemeral X25519 ECDH to establish a shared session root secret without transmitting the secret itself.
+* **Role-Bound Canonical Transcripts:** Explicitly requires `initiator` and `responder` roles during key exchange to construct role-independent canonical transcripts.
 * **Transcript-Bound SAS:** Derives a 48-bit Short Authentication String (SAS) from the X25519 shared secret and both ephemeral public keys. Comparing the SAS through an independent trusted channel provides protection against active man-in-the-middle attacks.
+* **Session ID Derivation:** Automatically derives a 128-bit unique session identifier alongside the root secret and SAS.
+* **Active Security Defenses:** Built-in protection against self-reflection attacks, low-order point / weak shared secret generation, and instance reuse.
 * **Automatic Epoch Key Derivation:** Encryption keys rotate every 60 seconds and are derived on demand from the session root secret using HKDF-SHA256.
 * **Authenticated Encryption:** AES-256-GCM provides confidentiality and integrity for every packet.
 * **Server-Blind Payloads:** Relay and storage layers do not possess the session root secret and therefore cannot decrypt payload contents.
 * **Strict Replay and Freshness Defense:** Timestamp validation, future-skew enforcement, and a bounded in-memory replay cache help prevent stale and replayed packets.
 * **Language-Agnostic Wire Format:** Packets use a strict binary layout and URL-safe Base64 encoding for compatibility with Python, Rust, C, Go, and other environments.
-* **No Persistent Identity Keys:** Ephemeral X25519 private keys are generated in memory and are not persisted by the KEX component.
+* **No Persistent Identity Keys:** Ephemeral X25519 private keys are generated in memory and enforced as single-use instances.
 
 ---
 
@@ -27,8 +30,9 @@ EBEC uses an ephemeral X25519 key exchange to establish a shared session root se
 
 * Confidentiality of encrypted payloads from intermediaries that do not possess the session root secret.
 * Integrity and authentication of packet contents through AES-256-GCM.
-* Ephemeral session establishment using X25519.
+* Ephemeral session establishment using X25519 with single-use session enforcement.
 * Peer authentication through an independently verified SAS.
+* Explicit reflection attack and low-order point shared-secret defenses.
 * Per-epoch encryption-key separation.
 * Packet freshness and replay detection within the configured acceptance window.
 
@@ -82,35 +86,37 @@ pip install cryptography
 
 ## Quick Start
 
-EBEC sessions should begin by establishing a shared root secret through the ephemeral X25519 key exchange.
+EBEC sessions begin by establishing a shared root secret through the ephemeral X25519 key exchange, specifying connection roles.
 
 ```python
 from engine import EphemeralCryptoEngine
 from kex import EphemeralKeyExchange
 
-# 1. Generate ephemeral X25519 state on both sides.
-alice_kex = EphemeralKeyExchange()
-bob_kex = EphemeralKeyExchange()
+# 1. Generate ephemeral X25519 state with explicit roles.
+alice_kex = EphemeralKeyExchange(role="initiator")
+bob_kex = EphemeralKeyExchange(role="responder")
 
 # 2. Exchange ephemeral public keys over the transport.
 alice_pub = alice_kex.get_public_bytes()
 bob_pub = bob_kex.get_public_bytes()
 
-# 3. Derive the session root secret and SAS on both sides.
-alice_root, alice_sas = alice_kex.derive_root_secret(bob_pub)
-bob_root, bob_sas = bob_kex.derive_root_secret(alice_pub)
+# 3. Derive session outputs (root secret, session ID, SAS) on both sides.
+alice_res = alice_kex.derive_session(bob_pub)
+bob_res = bob_kex.derive_session(alice_pub)
 
 # 4. Compare the SAS through an independent trusted channel.
 # Example:
-#   Alice: 4A8F2C9B1E03
-#   Bob:   4A8F2C9B1E03
-# Do not accept the session until the SAS values have been verified.
-if alice_sas != bob_sas:
+#   Alice SAS: 4A8F2C9B1E03
+#   Bob SAS:   4A8F2C9B1E03
+if alice_res.sas != bob_res.sas:
     raise RuntimeError("Key exchange authentication failed")
 
+# Print Derived Session ID
+print("Session ID:", alice_res.session_id.hex())
+
 # 5. Initialize the encryption engines.
-alice_engine = EphemeralCryptoEngine(alice_root)
-bob_engine = EphemeralCryptoEngine(bob_root)
+alice_engine = EphemeralCryptoEngine(alice_res.root_secret)
+bob_engine = EphemeralCryptoEngine(bob_res.root_secret)
 
 # 6. Encrypt on Alice's side.
 packet = alice_engine.encrypt("Secure transmission payload")
@@ -141,16 +147,16 @@ EBEC consists of two primary layers:
           │                     │
        X25519               AES-256-GCM
           │                     │
-       HKDF-SHA256          Epoch keys
+     HKDF-SHA256            Epoch keys
           │                     │
      Root Secret          Replay protection
           │                     │
-     SAS verification      Freshness checks
+     SAS & Session ID      Freshness checks
 ```
 
 ### 1. Ephemeral Key Exchange (`kex.py`)
 
-`kex.py` establishes the shared session root secret.
+`kex.py` establishes the shared session root secret, session ID, and SAS string.
 
 ```text
 Alice ephemeral private key
@@ -158,75 +164,54 @@ Alice ephemeral private key
 Bob ephemeral public key
               │
               ▼
-          X25519 ECDH
+     X25519 ECDH Exchange
               │
               ▼
-       Shared DH secret
+   Shared DH Secret Check
+  (Rejects weak / all-zero)
               │
               ▼
-          HKDF-SHA256
+    Canonical Transcript
+ (Initiator Pub + Responder Pub)
               │
-              ├──────────────► Root secret
+              ▼
+         HKDF-SHA256
               │
-              └──────────────► SAS key
-                                  │
-                                  ▼
+              ├──────────────► Root Secret      (ebec-kex-root-v1)
+              │
+              ├──────────────► Session ID       (ebec-session-id-v1)
+              │
+              └──────────────► SAS Key          (ebec-kex-sas-v1)
+                                    │
+                                    ▼
                          HMAC-SHA256 transcript
-                                  │
-                                  ▼
-                            48-bit SAS
+                                    │
+                                    ▼
+                               48-bit SAS
 ```
 
-Both parties independently derive the same root secret and SAS.
+Both parties independently derive the exact same root secret, session ID, and SAS.
 
-### 2. Transcript-Bound SAS
+### 2. Transcript-Bound SAS & Session ID
 
-The SAS is derived from:
-
-* EBEC KEX protocol version.
-* Both ephemeral X25519 public keys.
-* The X25519 shared secret.
-
-The public keys are canonically sorted and length-prefixed before being included in the transcript:
+The transcript is constructed strictly based on protocol role (`initiator` vs `responder`), ensuring that both peers generate identical transcript byte representations regardless of execution timing:
 
 ```text
-EBEC-KEX-v1
-    +
-Public Key A
-    +
-Public Key B
-    │
-    ▼
-Transcript
-    │
-    ▼
-HMAC-SHA256 using KEX-derived SAS key
-    │
-    ▼
-48-bit / 12-character hexadecimal SAS
+PROTOCOL_VERSION ("EBEC-KEX-v1")
+        +
+Initiator Public Key (32 bytes)
+        +
+Responder Public Key (32 bytes)
+        │
+        ▼
+   Transcript
 ```
 
-The transcript binding prevents the authentication value from being independent of the specific key exchange.
+Key material is derived from `master_secret` using explicit HKDF domain separation context labels:
 
-The SAS key and encryption root secret are derived independently using different HKDF info contexts:
-
-* `ebec-kex-root-v1`
-* `ebec-kex-sas-v1`
-
-This provides domain separation between encryption key material and SAS authentication material.
-
-### 3. SAS Verification
-
-X25519 by itself does not authenticate the peer and is vulnerable to an active man-in-the-middle attack. EBEC addresses this by requiring both parties to compare the derived SAS through an independent trusted channel.
-
-For example:
-
-* **Alice:** `4A8F2C9B1E03`
-* **Bob:** `4A8F2C9B1E03`
-
-If the values match and the comparison is performed through an independent trusted channel, the parties have authenticated their key-exchange transcript and demonstrated agreement on the derived shared secret. If they do not match, the session must be aborted.
-
-*The SAS must not simply be accepted from the same untrusted transport used to exchange the public keys.*
+* Root Secret: `ebec-kex-root-v1`
+* Session ID: `ebec-session-id-v1`
+* SAS Key: `ebec-kex-sas-v1`
 
 ---
 
@@ -252,60 +237,18 @@ The epoch number is public and is used as HKDF salt material:
                  Root Secret
                       │
                       ▼
-               HKDF-SHA256
+                 HKDF-SHA256
                       │
-               epoch number
-                      │
-                      ▼
-                AES-256 key
+                 epoch number
                       │
                       ▼
-                 AES-GCM
+                  AES-256 key
+                      │
+                      ▼
+                   AES-GCM
 ```
 
 Each epoch therefore has its own encryption key. Knowledge of one individual epoch key does not directly reveal the root secret or allow direct calculation of another epoch key.
-
-### Important Forward-Secrecy Limitation
-
-Epoch rotation should not be confused with full forward secrecy. All epoch keys are ultimately derived from the same session root secret:
-
-```text
-Root Secret
-   ├── Epoch N-1
-   ├── Epoch N
-   ├── Epoch N+1
-   └── ...
-```
-
-Therefore, if an attacker obtains the root secret, they can derive both historical and future epoch keys. Applications requiring forward secrecy after compromise of session state should use an evolving key schedule or ratcheting construction.
-
----
-
-## AES-256-GCM Encryption
-
-EBEC uses AES-256-GCM for authenticated encryption. Each packet receives a fresh 96-bit random nonce:
-
-```python
-nonce = secrets.token_bytes(12)
-```
-
-The packet header is supplied as AES-GCM associated authenticated data (AAD):
-
-```python
-ciphertext = aesgcm.encrypt(
-    nonce,
-    payload_bytes,
-    header,
-)
-```
-
-This means the following fields are authenticated:
-
-* Magic
-* Version
-* Timestamp
-
-An attacker cannot modify these fields without causing GCM authentication to fail. The nonce is transmitted in plaintext because GCM nonces do not need to be secret.
 
 ---
 
@@ -329,77 +272,27 @@ This means:
 
 The replay cache is bounded to prevent unbounded memory growth. Replay detection is therefore limited to the configured freshness window and retained replay state.
 
-*Timestamp validation does not prove when a packet was originally created. The timestamp is authenticated as packet metadata, but a holder of the encryption key can construct a packet containing a chosen valid timestamp.*
-
----
-
-## Server-Blind Payloads
-
-EBEC is designed so that relay and storage infrastructure does not possess the session root secret. A transport server can forward or store Base64 packets without possessing the key necessary to decrypt its payload.
-
-However, EBEC does not hide all transport metadata. Depending on the surrounding application and transport, intermediaries may still observe:
-
-* Packet size.
-* Transmission timing.
-* Routing information.
-* The authenticated packet timestamp.
-* Connection metadata.
-
-*EBEC provides payload confidentiality, not traffic-analysis resistance.*
-
----
-
-## Application-Layer Root Secret Rotation
-
-Applications with long-running sessions may periodically establish a new root secret. A new root secret must be securely communicated to the peer through a corresponding authenticated key-establishment mechanism.
-
-Simply generating a new root secret locally does not synchronize it with the remote endpoint. For example:
-
-```python
-new_root_secret = EphemeralCryptoEngine.generate_root_secret()
-```
-
-This only creates local key material. The peer cannot decrypt packets using that secret until it has securely received or independently derived the same secret. Applications requiring seamless root rotation should maintain overlapping authenticated sessions during the transition.
-
----
-
-## Wire Format Example
-
-A packet consists of:
-
-```text
-EC
-01
-[timestamp: 8 bytes]
-[nonce: 12 bytes]
-[ciphertext + 16-byte GCM tag]
-```
-
-The complete binary structure is then URL-safe Base64 encoded. The format is intentionally independent of Python so that compatible implementations can be written in other languages.
-
 ---
 
 ## API Reference
 
 ### Key Exchange API (`kex.py`)
 
-Exposes `EphemeralKeyExchange()`:
+#### `KexResult` Dataclass
+Immutable dataclass holding the outcome of a completed key exchange:
+* `root_secret`: `bytes` (32 bytes)
+* `session_id`: `bytes` (16 bytes)
+* `sas`: `str` (12-character uppercase hex string)
 
-* **Generate a public key:**
-  ```python
-  public_key = kex.get_public_bytes()
-  ```
-  *Returns the 32-byte raw X25519 public key.*
-
-* **Derive the session root and SAS:**
-  ```python
-  root_secret, sas = kex.derive_root_secret(peer_public_key)
-  ```
-  *Returns:*
-  * `root_secret`: 32 bytes
-  * `sas`: 12-character hexadecimal string
-
-*The root secret should only be used after successful SAS verification.*
+#### `EphemeralKeyExchange(role: str)`
+Initializes a single-use X25519 key exchange state.
+* **Parameters:** `role` - Must be either `'initiator'` or `'responder'`.
+* **`get_public_bytes() -> bytes`**
+  Returns the local 32-byte raw X25519 public key.
+* **`derive_session(peer_public_bytes: bytes) -> KexResult`**
+  Completes key agreement given the peer's 32-byte public key. Performs reflection checks, validates shared secret strength, constructs the transcript, and returns a `KexResult`. Raises `RuntimeError` if invoked more than once.
+* **`derive_root_secret(peer_public_bytes: bytes) -> tuple[bytes, str]`** *(Legacy Helper)*
+  Returns `(root_secret, sas)`.
 
 ---
 
@@ -433,34 +326,19 @@ Exposes `EphemeralCryptoEngine(root_secret)`:
 
 * Passive network interception.
 * Passive observation of the X25519 public-key exchange.
-* Modification of authenticated packet contents.
-* Modification of authenticated packet metadata.
+* Self-reflection attacks during key exchange.
+* All-zero / low-order point key agreement vulnerabilities.
+* Key exchange instance reuse.
+* Modification of authenticated packet contents or metadata.
 * Straightforward packet replay within the configured replay window.
 * Active key substitution when the SAS is correctly verified out-of-band.
 
 ### EBEC does NOT protect against:
 
-* Compromise of an endpoint.
-* Theft of the session root secret.
-* Theft of plaintext before encryption or after decryption.
+* Compromise of an endpoint or theft of session state / plaintext.
 * A compromised trusted SAS-verification channel.
-* Traffic analysis.
+* Traffic analysis (packet sizing, timing, routing).
 * Root-secret compromise followed by derivation of historical epoch keys.
-* Malicious peers that legitimately possess the session encryption key.
-
----
-
-## Security Considerations
-
-EBEC relies on the security properties of:
-
-* X25519
-* HKDF-SHA256
-* HMAC-SHA256
-* AES-256-GCM
-* Cryptographically secure random number generation provided by the Python `secrets` module and the underlying cryptographic library.
-
-The security of the overall protocol also depends on correct key lifecycle management, secure endpoint storage, correct SAS verification, clock behavior, and safe handling of the resulting plaintext.
 
 ---
 
