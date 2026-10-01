@@ -7,7 +7,10 @@ import struct
 import time
 from collections import OrderedDict
 
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
 
 class EphemeralCryptoEngine:
     """
@@ -16,7 +19,8 @@ class EphemeralCryptoEngine:
     Features:
 
     - AES-256-GCM authenticated encryption
-    - Separate send and receive keys
+    - Per-epoch AES-256 key derivation
+    - Independent send/receive key separation
     - 128-bit authenticated session ID
     - Explicit authenticated packet direction
     - Fresh 96-bit nonce per packet
@@ -42,6 +46,20 @@ class EphemeralCryptoEngine:
 
         0x01 = initiator -> responder
         0x02 = responder -> initiator
+
+    Epoch keys are derived on demand from the session root secret:
+
+        session root
+             |
+             +-- direction
+             +-- session ID
+             +-- epoch number
+             |
+             v
+          HKDF-SHA256
+             |
+             v
+        AES-256-GCM key
     """
 
     MAGIC = b"EC"
@@ -55,20 +73,18 @@ class EphemeralCryptoEngine:
     KEY_SIZE = 32
     GCM_TAG_SIZE = 16
 
-    # Keys are derived by the KEX layer.
-    #
-    # Epoch key derivation can be added later if required. The current
-    # engine uses the direction-specific AES-256 keys supplied by KEX.
+    # Encryption keys rotate every 60 seconds.
+    EPOCH_SECONDS = 60
+
+    # Domain-separated HKDF context for packet encryption.
+    EPOCH_KEY_INFO = b"ebec-epoch-aead-v1"
 
     MAX_FUTURE_SKEW = 30
     MAX_PACKET_AGE = 5 * 60
 
     MAX_REPLAY_CACHE = 10_000
 
-    # Maximum plaintext size accepted by this engine.
-    #
-    # This is deliberately bounded to prevent an attacker from causing
-    # excessive memory usage through oversized packets.
+    # Maximum plaintext accepted by this engine.
     MAX_PAYLOAD_SIZE = 1024 * 1024  # 1 MiB
 
     # Header:
@@ -87,8 +103,7 @@ class EphemeralCryptoEngine:
         self,
         *,
         session_id: bytes,
-        send_key: bytes,
-        receive_key: bytes,
+        root_secret: bytes,
         direction: int,
     ):
         """
@@ -98,11 +113,8 @@ class EphemeralCryptoEngine:
             session_id:
                 16-byte session identifier produced by the KEX.
 
-            send_key:
-                32-byte AES-256 key used for outgoing packets.
-
-            receive_key:
-                32-byte AES-256 key used for incoming packets.
+            root_secret:
+                32-byte session root secret produced by the KEX.
 
             direction:
                 Direction used for packets sent by this instance.
@@ -114,6 +126,11 @@ class EphemeralCryptoEngine:
                 or:
 
                     DIRECTION_RESPONDER_TO_INITIATOR
+
+        The engine does NOT store static AES send/receive keys.
+
+        Instead, the AES key for each packet is derived from the
+        session root secret and that packet's timestamp epoch.
         """
 
         if not isinstance(session_id, bytes):
@@ -125,20 +142,12 @@ class EphemeralCryptoEngine:
                 f"{self.SESSION_ID_SIZE} bytes"
             )
 
-        if not isinstance(send_key, bytes):
-            raise TypeError("send_key must be bytes")
+        if not isinstance(root_secret, bytes):
+            raise TypeError("root_secret must be bytes")
 
-        if len(send_key) != self.KEY_SIZE:
+        if len(root_secret) != self.KEY_SIZE:
             raise ValueError(
-                f"send_key must be exactly {self.KEY_SIZE} bytes"
-            )
-
-        if not isinstance(receive_key, bytes):
-            raise TypeError("receive_key must be bytes")
-
-        if len(receive_key) != self.KEY_SIZE:
-            raise ValueError(
-                f"receive_key must be exactly {self.KEY_SIZE} bytes"
+                f"root_secret must be exactly {self.KEY_SIZE} bytes"
             )
 
         if direction not in (
@@ -148,8 +157,7 @@ class EphemeralCryptoEngine:
             raise ValueError("invalid direction")
 
         self.session_id = session_id
-        self.send_key = send_key
-        self.receive_key = receive_key
+        self.root_secret = root_secret
         self.direction = direction
 
         # Direction expected from incoming packets.
@@ -176,29 +184,22 @@ class EphemeralCryptoEngine:
         """
         Construct an engine directly from a KexResult.
 
-        This avoids manually copying session_id/send_key/receive_key.
+        The KexResult must contain:
 
-        The KexResult must have been produced by EphemeralKeyExchange.
+            root_secret
+            session_id
+            sas
+
+        The role is still required because packet direction is
+        intentionally separate from the session root secret.
         """
-
-        # Import lazily to avoid making engine.py depend on kex.py
-        # at module import time.
-        from kex import EphemeralKeyExchange
 
         if not hasattr(kex_result, "session_id"):
             raise TypeError("invalid KexResult")
 
-        if not hasattr(kex_result, "send_key"):
+        if not hasattr(kex_result, "root_secret"):
             raise TypeError("invalid KexResult")
 
-        if not hasattr(kex_result, "receive_key"):
-            raise TypeError("invalid KexResult")
-
-        if not isinstance(kex_result, object):
-            raise TypeError("invalid KexResult")
-
-        # KexResult does not itself expose the role, so the direction
-        # must be inferred by the caller using from_kex_result_with_role().
         raise TypeError(
             "use from_kex_result_with_role() and provide "
             "the KEX role"
@@ -221,8 +222,10 @@ class EphemeralCryptoEngine:
 
         if role == "initiator":
             direction = cls.DIRECTION_INITIATOR_TO_RESPONDER
+
         elif role == "responder":
             direction = cls.DIRECTION_RESPONDER_TO_INITIATOR
+
         else:
             raise ValueError(
                 "role must be either 'initiator' or 'responder'"
@@ -230,8 +233,7 @@ class EphemeralCryptoEngine:
 
         return cls(
             session_id=kex_result.session_id,
-            send_key=kex_result.send_key,
-            receive_key=kex_result.receive_key,
+            root_secret=kex_result.root_secret,
             direction=direction,
         )
 
@@ -240,16 +242,80 @@ class EphemeralCryptoEngine:
         """
         Generate a cryptographically secure 256-bit root secret.
 
-        This method is retained for compatibility with older EBEC
-        application code.
-
-        For a normal P2P session, the root secret should be derived
-        through EphemeralKeyExchange instead.
+        For a normal P2P session, the root secret should instead be
+        established through EphemeralKeyExchange.
         """
-        return secrets.token_bytes(32)
+        return secrets.token_bytes(cls.KEY_SIZE)
 
     def _current_time(self) -> int:
         return int(time.time())
+
+    def _epoch_for_timestamp(self, timestamp: int) -> int:
+        """
+        Convert a Unix timestamp into the corresponding EBEC epoch.
+        """
+        return timestamp // self.EPOCH_SECONDS
+
+    def _derive_epoch_key(
+        self,
+        *,
+        epoch: int,
+        direction: int,
+    ) -> bytes:
+        """
+        Derive the AES-256-GCM key for a specific epoch and direction.
+
+        The derivation is:
+
+            root_secret
+                |
+                +-- session_id
+                +-- direction
+                +-- epoch
+                |
+                v
+            HKDF-SHA256
+                |
+                v
+            32-byte AES key
+
+        Direction separation ensures that the key used for
+        initiator -> responder traffic is different from the key
+        used for responder -> initiator traffic.
+
+        Session-ID binding prevents accidental key reuse across
+        independent sessions even if root material were ever reused.
+        """
+
+        if direction not in (
+            self.DIRECTION_INITIATOR_TO_RESPONDER,
+            self.DIRECTION_RESPONDER_TO_INITIATOR,
+        ):
+            raise ValueError("invalid direction")
+
+        if epoch < 0:
+            raise ValueError("epoch cannot be negative")
+
+        # Canonical binary derivation context.
+        #
+        # session_id: 16 bytes
+        # direction:   1 byte
+        # epoch:       8 bytes
+        #
+        # This context is supplied as HKDF salt so that each epoch and
+        # direction receives independent key material.
+        salt = hashlib.sha256(
+            self.session_id
+            + bytes([direction])
+            + struct.pack("!Q", epoch)
+        ).digest()
+
+        return HKDF(
+            algorithm=hashes.SHA256(),
+            length=self.KEY_SIZE,
+            salt=salt,
+            info=self.EPOCH_KEY_INFO,
+        ).derive(self.root_secret)
 
     def _build_header(self, timestamp: int) -> bytes:
         """
@@ -316,7 +382,14 @@ class EphemeralCryptoEngine:
         """
         Encrypt a payload and return a URL-safe Base64 packet.
 
-        The outgoing packet uses this engine's send_key and direction.
+        The AES key is derived from:
+
+            session root
+            + this engine's direction
+            + timestamp epoch
+
+        Therefore the encryption key automatically changes every
+        EPOCH_SECONDS.
         """
 
         if isinstance(payload, str):
@@ -345,6 +418,14 @@ class EphemeralCryptoEngine:
                 "timestamp cannot be negative"
             )
 
+        epoch = self._epoch_for_timestamp(timestamp)
+
+        # Derive the key for this exact outgoing epoch and direction.
+        encryption_key = self._derive_epoch_key(
+            epoch=epoch,
+            direction=self.direction,
+        )
+
         header = self._build_header(timestamp)
 
         # AES-GCM requires a unique nonce for a given key.
@@ -353,7 +434,7 @@ class EphemeralCryptoEngine:
         # generated for every packet.
         nonce = secrets.token_bytes(self.NONCE_SIZE)
 
-        aesgcm = AESGCM(self.send_key)
+        aesgcm = AESGCM(encryption_key)
 
         ciphertext = aesgcm.encrypt(
             nonce,
@@ -371,6 +452,12 @@ class EphemeralCryptoEngine:
     ) -> tuple[int, bytes]:
         """
         Decrypt and authenticate an incoming packet.
+
+        The AES key is derived from:
+
+            session root
+            + packet direction
+            + packet timestamp epoch
 
         Returns:
 
@@ -488,6 +575,15 @@ class EphemeralCryptoEngine:
                 "replayed packet"
             )
 
+        # Derive the receive key from the packet's authenticated
+        # direction and timestamp epoch.
+        epoch = self._epoch_for_timestamp(timestamp)
+
+        decryption_key = self._derive_epoch_key(
+            epoch=epoch,
+            direction=direction,
+        )
+
         nonce_start = self.HEADER_SIZE
         nonce_end = nonce_start + self.NONCE_SIZE
 
@@ -504,7 +600,7 @@ class EphemeralCryptoEngine:
             : self.HEADER_SIZE
         ]
 
-        aesgcm = AESGCM(self.receive_key)
+        aesgcm = AESGCM(decryption_key)
 
         try:
             plaintext = aesgcm.decrypt(
