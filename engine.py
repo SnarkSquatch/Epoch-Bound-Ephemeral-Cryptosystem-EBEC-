@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import secrets
 import struct
 import time
 from collections import OrderedDict
 
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -138,8 +140,7 @@ class EphemeralCryptoEngine:
 
         if len(session_id) != self.SESSION_ID_SIZE:
             raise ValueError(
-                f"session_id must be exactly "
-                f"{self.SESSION_ID_SIZE} bytes"
+                f"session_id must be exactly {self.SESSION_ID_SIZE} bytes"
             )
 
         if not isinstance(root_secret, bytes):
@@ -162,74 +163,53 @@ class EphemeralCryptoEngine:
 
         # Direction expected from incoming packets.
         if direction == self.DIRECTION_INITIATOR_TO_RESPONDER:
-            self.receive_direction = (
-                self.DIRECTION_RESPONDER_TO_INITIATOR
-            )
+            self.receive_direction = self.DIRECTION_RESPONDER_TO_INITIATOR
         else:
-            self.receive_direction = (
-                self.DIRECTION_INITIATOR_TO_RESPONDER
-            )
+            self.receive_direction = self.DIRECTION_INITIATOR_TO_RESPONDER
 
         # OrderedDict gives us a bounded replay cache.
         #
-        # Key:
-        #     SHA-256(packet)
-        #
-        # Value:
-        #     timestamp
+        # Key:   SHA-256(packet)
+        # Value: timestamp
         self._replay_cache: OrderedDict[bytes, int] = OrderedDict()
 
     @classmethod
-    def from_kex_result(cls, kex_result):
+    def from_kex_result(cls, kex_result, role: str) -> EphemeralCryptoEngine:
         """
-        Construct an engine directly from a KexResult.
+        Construct an engine directly from a KexResult and role.
 
-        The KexResult must contain:
-
-            root_secret
-            session_id
-            sas
-
-        The role is still required because packet direction is
-        intentionally separate from the session root secret.
+        role must be either:
+            "initiator"
+            "responder"
         """
 
-        if not hasattr(kex_result, "session_id"):
-            raise TypeError("invalid KexResult")
+        if not hasattr(kex_result, "session_id") or not hasattr(
+            kex_result, "root_secret"
+        ):
+            raise TypeError("invalid KexResult object provided")
 
-        if not hasattr(kex_result, "root_secret"):
-            raise TypeError("invalid KexResult")
-
-        raise TypeError(
-            "use from_kex_result_with_role() and provide "
-            "the KEX role"
-        )
+        return cls.from_kex_result_with_role(kex_result, role=role)
 
     @classmethod
     def from_kex_result_with_role(
         cls,
         kex_result,
         role: str,
-    ):
+    ) -> EphemeralCryptoEngine:
         """
         Construct an engine from a KexResult and its KEX role.
 
         role must be:
-
             "initiator"
             "responder"
         """
 
         if role == "initiator":
             direction = cls.DIRECTION_INITIATOR_TO_RESPONDER
-
         elif role == "responder":
             direction = cls.DIRECTION_RESPONDER_TO_INITIATOR
-
         else:
-            raise ValueError(
-                "role must be either 'initiator' or 'responder'"
-            )
+            raise ValueError("role must be either 'initiator' or 'responder'")
 
         return cls(
             session_id=kex_result.session_id,
@@ -264,27 +244,6 @@ class EphemeralCryptoEngine:
     ) -> bytes:
         """
         Derive the AES-256-GCM key for a specific epoch and direction.
-
-        The derivation is:
-
-            root_secret
-                |
-                +-- session_id
-                +-- direction
-                +-- epoch
-                |
-                v
-            HKDF-SHA256
-                |
-                v
-            32-byte AES key
-
-        Direction separation ensures that the key used for
-        initiator -> responder traffic is different from the key
-        used for responder -> initiator traffic.
-
-        Session-ID binding prevents accidental key reuse across
-        independent sessions even if root material were ever reused.
         """
 
         if direction not in (
@@ -296,14 +255,6 @@ class EphemeralCryptoEngine:
         if epoch < 0:
             raise ValueError("epoch cannot be negative")
 
-        # Canonical binary derivation context.
-        #
-        # session_id: 16 bytes
-        # direction:   1 byte
-        # epoch:       8 bytes
-        #
-        # This context is supplied as HKDF salt so that each epoch and
-        # direction receives independent key material.
         salt = hashlib.sha256(
             self.session_id
             + bytes([direction])
@@ -321,7 +272,6 @@ class EphemeralCryptoEngine:
         """
         Build the authenticated packet header.
         """
-
         return struct.pack(
             self.HEADER_FORMAT,
             self.MAGIC,
@@ -335,7 +285,6 @@ class EphemeralCryptoEngine:
         """
         Remove expired replay entries and enforce the cache limit.
         """
-
         expiration = now - self.MAX_PACKET_AGE
 
         expired = [
@@ -358,20 +307,16 @@ class EphemeralCryptoEngine:
         """
         Reject timestamps that are too old or too far in the future.
         """
-
         if timestamp < now - self.MAX_PACKET_AGE:
             raise ValueError("packet has expired")
 
         if timestamp > now + self.MAX_FUTURE_SKEW:
-            raise ValueError(
-                "packet timestamp is too far in the future"
-            )
+            raise ValueError("packet timestamp is too far in the future")
 
     def _validate_payload_size(self, payload: bytes) -> None:
         if len(payload) > self.MAX_PAYLOAD_SIZE:
             raise ValueError(
-                f"payload exceeds maximum size of "
-                f"{self.MAX_PAYLOAD_SIZE} bytes"
+                f"payload exceeds maximum size of {self.MAX_PAYLOAD_SIZE} bytes"
             )
 
     def encrypt(
@@ -381,27 +326,13 @@ class EphemeralCryptoEngine:
     ) -> str:
         """
         Encrypt a payload and return a URL-safe Base64 packet.
-
-        The AES key is derived from:
-
-            session root
-            + this engine's direction
-            + timestamp epoch
-
-        Therefore the encryption key automatically changes every
-        EPOCH_SECONDS.
         """
-
         if isinstance(payload, str):
             payload_bytes = payload.encode("utf-8")
-
         elif isinstance(payload, bytes):
             payload_bytes = payload
-
         else:
-            raise TypeError(
-                "payload must be str or bytes"
-            )
+            raise TypeError("payload must be str or bytes")
 
         self._validate_payload_size(payload_bytes)
 
@@ -409,29 +340,19 @@ class EphemeralCryptoEngine:
             timestamp = self._current_time()
 
         if not isinstance(timestamp, int):
-            raise TypeError(
-                "timestamp must be an integer"
-            )
+            raise TypeError("timestamp must be an integer")
 
         if timestamp < 0:
-            raise ValueError(
-                "timestamp cannot be negative"
-            )
+            raise ValueError("timestamp cannot be negative")
 
         epoch = self._epoch_for_timestamp(timestamp)
 
-        # Derive the key for this exact outgoing epoch and direction.
         encryption_key = self._derive_epoch_key(
             epoch=epoch,
             direction=self.direction,
         )
 
         header = self._build_header(timestamp)
-
-        # AES-GCM requires a unique nonce for a given key.
-        #
-        # A fresh cryptographically secure random 96-bit nonce is
-        # generated for every packet.
         nonce = secrets.token_bytes(self.NONCE_SIZE)
 
         aesgcm = AESGCM(encryption_key)
@@ -453,30 +374,14 @@ class EphemeralCryptoEngine:
         """
         Decrypt and authenticate an incoming packet.
 
-        The AES key is derived from:
-
-            session root
-            + packet direction
-            + packet timestamp epoch
-
         Returns:
-
             (timestamp, plaintext_bytes)
-
-        Raises ValueError for malformed, expired, future-dated,
-        wrong-session, wrong-direction, unauthenticated, or replayed
-        packets.
         """
-
         if not isinstance(encoded_packet, str):
-            raise TypeError(
-                "encoded_packet must be str"
-            )
+            raise TypeError("encoded_packet must be str")
 
         if not encoded_packet:
-            raise ValueError(
-                "packet cannot be empty"
-            )
+            raise ValueError("packet cannot be empty")
 
         try:
             packet = base64.b64decode(
@@ -484,25 +389,16 @@ class EphemeralCryptoEngine:
                 altchars=b"-_",
                 validate=True,
             )
-
-        except (ValueError, UnicodeEncodeError):
-            raise ValueError(
-                "invalid Base64 packet"
-            )
+        except (ValueError, UnicodeEncodeError, binascii.Error) as exc:
+            raise ValueError("invalid Base64 packet") from exc
 
         minimum_size = (
-            self.HEADER_SIZE
-            + self.NONCE_SIZE
-            + self.GCM_TAG_SIZE
+            self.HEADER_SIZE + self.NONCE_SIZE + self.GCM_TAG_SIZE
         )
 
         if len(packet) < minimum_size:
-            raise ValueError(
-                "packet is too short"
-            )
+            raise ValueError("packet is too short")
 
-        # Enforce a maximum packet size before performing expensive
-        # cryptographic operations.
         maximum_packet_size = (
             self.HEADER_SIZE
             + self.NONCE_SIZE
@@ -511,9 +407,7 @@ class EphemeralCryptoEngine:
         )
 
         if len(packet) > maximum_packet_size:
-            raise ValueError(
-                "packet exceeds maximum size"
-            )
+            raise ValueError("packet exceeds maximum size")
 
         try:
             (
@@ -526,57 +420,31 @@ class EphemeralCryptoEngine:
                 self.HEADER_FORMAT,
                 packet[: self.HEADER_SIZE],
             )
+        except struct.error as exc:
+            raise ValueError("invalid packet header") from exc
 
-        except struct.error:
-            raise ValueError(
-                "invalid packet header"
-            )
-
-        # Validate protocol identity.
         if magic != self.MAGIC:
-            raise ValueError(
-                "invalid packet magic"
-            )
+            raise ValueError("invalid packet magic")
 
         if version != self.VERSION:
-            raise ValueError(
-                "unsupported packet version"
-            )
+            raise ValueError("unsupported packet version")
 
-        # Ensure this packet belongs to this session.
-        if not secrets.compare_digest(
-            session_id,
-            self.session_id,
-        ):
-            raise ValueError(
-                "packet belongs to a different session"
-            )
+        if not secrets.compare_digest(session_id, self.session_id):
+            raise ValueError("packet belongs to a different session")
 
-        # Ensure the packet came from the expected peer direction.
         if direction != self.receive_direction:
-            raise ValueError(
-                "invalid packet direction"
-            )
+            raise ValueError("invalid packet direction")
 
         now = self._current_time()
 
         self._cleanup_replay_cache(now)
+        self._validate_timestamp(timestamp, now)
 
-        self._validate_timestamp(
-            timestamp,
-            now,
-        )
-
-        # Hash the complete packet for replay tracking.
         packet_id = hashlib.sha256(packet).digest()
 
         if packet_id in self._replay_cache:
-            raise ValueError(
-                "replayed packet"
-            )
+            raise ValueError("replayed packet")
 
-        # Derive the receive key from the packet's authenticated
-        # direction and timestamp epoch.
         epoch = self._epoch_for_timestamp(timestamp)
 
         decryption_key = self._derive_epoch_key(
@@ -587,18 +455,9 @@ class EphemeralCryptoEngine:
         nonce_start = self.HEADER_SIZE
         nonce_end = nonce_start + self.NONCE_SIZE
 
-        nonce = packet[
-            nonce_start:nonce_end
-        ]
-
-        ciphertext = packet[
-            nonce_end:
-        ]
-
-        # The header is authenticated as AES-GCM AAD.
-        header = packet[
-            : self.HEADER_SIZE
-        ]
+        nonce = packet[nonce_start:nonce_end]
+        ciphertext = packet[nonce_end:]
+        header = packet[: self.HEADER_SIZE]
 
         aesgcm = AESGCM(decryption_key)
 
@@ -608,17 +467,13 @@ class EphemeralCryptoEngine:
                 ciphertext,
                 header,
             )
-
+        except InvalidTag as exc:
+            raise ValueError("authentication failed: invalid AEAD tag") from exc
         except Exception as exc:
-            raise ValueError(
-                "authentication failed"
-            ) from exc
+            raise ValueError("decryption failed") from exc
 
-        self._validate_payload_size(
-            plaintext
-        )
+        self._validate_payload_size(plaintext)
 
-        # Only record the packet after successful authentication.
         self._replay_cache[packet_id] = timestamp
 
         return timestamp, plaintext
