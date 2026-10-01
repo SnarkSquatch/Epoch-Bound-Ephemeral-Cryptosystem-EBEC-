@@ -9,7 +9,7 @@ on the fly from a shared, previously negotiated root secret.
 
 ## Core Features
 
-* **Zero Key Management:** No PGP Key rings, no certificate authorities, and no long term identity keys sitting on disk.
+* **Automatic Key Rotation:** No PGP Key rings, no certificate authorities, and no long term identity keys sitting on disk.
 * **Forward Secrecy via Epoch Rotation:** Keys rotate automatically every 60 seconds. Compromising a key yields zero insight
   into past or future epochs.
 * **Server Blind Storage:** Intermediary transport layers (mail queues, WebSockets, or relay nodes) handle purely opaque
