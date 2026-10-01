@@ -1,4 +1,4 @@
-# Epoch Bound Ephemeral Cryptosystem (EBEC)
+# Epoch Bound Ephemeral Cypher (EBEC)
 
 A lightweight, server blind cryptographic engine designed for ephemeral data transmission. 
 
