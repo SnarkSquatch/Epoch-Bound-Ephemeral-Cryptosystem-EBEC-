@@ -1,6 +1,6 @@
 # Epoch Bound Ephemeral Cryptosystem (EBEC)
 
-A lightweight, zero knowledge, server blind cryptographic engine designed for ephemeral data transmission. 
+A lightweight, server blind cryptographic engine designed for ephemeral data transmission. 
 
 It eliminates static key rings, long term identity exposure, and single points of failure by deriving per epoch symmetric keys
 on the fly from a shared, previously negotiated root secret. 
