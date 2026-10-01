@@ -246,7 +246,9 @@ epoch = timestamp // 60
 
 To provide strict key separation between directions and epochs, a **public-derived salt** is constructed using a SHA-256 digest:
 
+```text
 $$\text{salt} = \text{SHA-256}(\text{session\_id} \parallel \text{direction\_byte} \parallel \text{struct.pack}("!\text{Q}", \text{epoch}))$$
+```
 
 The key is derived using HKDF-SHA256, where the cryptographic security relies entirely on the `root_secret` functioning as the Input Key Material (IKM):
 
