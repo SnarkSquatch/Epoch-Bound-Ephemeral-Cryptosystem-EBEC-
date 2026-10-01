@@ -74,6 +74,35 @@ in transit instantly invalidates the authentication tag.
 3. Replay & Skew Mitigation: Incoming packets are hashed via SHA-256(packet) and checked against a size-capped OrderedDict replay cache. Includes 
 age expiration (MAX_PACKET_AGE = 300s) and future skew tolerance (MAX_FUTURE_SKEW = 30s).
 
+## Advanced Usage: Application-Layer Secret Rotation
+
+For long running daemons or multisession environments, you can manage root secret lifecycles at the application layer using a wrapper to handle transition overlaps without dropping packets:
+
+```python
+import time
+from engine import EphemeralCryptoEngine
+
+class SecureSessionManager:
+    def __init__(self, rotation_interval=86400):
+        self.current_engine = EphemeralCryptoEngine(EphemeralCryptoEngine.generate_root_secret())
+        self.previous_engine = None
+        self.last_rotation = time.time()
+        self.rotation_interval = rotation_interval
+
+    def decrypt(self, packet: str):
+        if time.time() - self.last_rotation > self.rotation_interval:
+            self.previous_engine = self.current_engine
+            self.current_engine = EphemeralCryptoEngine(EphemeralCryptoEngine.generate_root_secret())
+            self.last_rotation = time.time()
+
+        try:
+            return self.current_engine.decrypt(packet)
+        except ValueError:
+            if self.previous_engine:
+                return self.previous_engine.decrypt(packet)
+            raise
+```  
+
 ## License
 
 This project is open source software licensed under the GNU General Public License v3.0 (GPLv3). See the [LICENSE](LICENSE) for
