@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import secrets
 import struct
 from dataclasses import dataclass
 
@@ -10,31 +9,28 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
+
 @dataclass(frozen=True)
 class KexResult:
     """
-    Result of a completed X25519 key exchange.
+    Result of a completed EBEC X25519 key exchange.
 
     root_secret:
         32-byte session root secret.
 
     session_id:
-        16-byte identifier derived from the authenticated KEX transcript.
-
-    send_key:
-        32-byte AES-256 key used for packets sent by this peer.
-
-    receive_key:
-        32-byte AES-256 key used for packets received by this peer.
+        16-byte identifier derived from the authenticated KEX
+        transcript.
 
     sas:
         12-character hexadecimal Short Authentication String.
+
+    The root_secret is consumed by EphemeralCryptoEngine, which
+    derives per-epoch directional AES-256-GCM keys from it.
     """
 
     root_secret: bytes
     session_id: bytes
-    send_key: bytes
-    receive_key: bytes
     sas: str
 
 
@@ -46,26 +42,30 @@ class EphemeralKeyExchange:
 
         - a 32-byte session root secret
         - a 16-byte session ID
-        - independent A->B and B->A encryption keys
         - a transcript-bound 48-bit SAS
+
+    Per-epoch encryption keys are deliberately NOT derived here.
+
+    EphemeralCryptoEngine is responsible for deriving AES-256-GCM
+    keys from:
+
+        session root
+        + session ID
+        + direction
+        + epoch number
 
     The peer roles must be explicitly specified as either:
 
         "initiator"
         "responder"
-
-    The initiator's send key is the responder's receive key, and
-    the responder's send key is the initiator's receive key.
     """
 
     PROTOCOL_VERSION = b"EBEC-KEX-v1"
 
+    MASTER_INFO = b"ebec-kex-master-v1"
     ROOT_INFO = b"ebec-kex-root-v1"
     SAS_INFO = b"ebec-kex-sas-v1"
     SESSION_ID_INFO = b"ebec-session-id-v1"
-
-    INITIATOR_TO_RESPONDER_INFO = b"ebec-a-to-b-v1"
-    RESPONDER_TO_INITIATOR_INFO = b"ebec-b-to-a-v1"
 
     SAS_LENGTH_BYTES = 6
     SESSION_ID_LENGTH = 16
@@ -79,9 +79,16 @@ class EphemeralKeyExchange:
 
         self.role = role
 
-        # Generate a fresh, ephemeral X25519 keypair.
+        # Generate a fresh ephemeral X25519 keypair.
+        #
+        # The private key exists only in memory and is never persisted
+        # by this component.
         self._private_key = x25519.X25519PrivateKey.generate()
         self._public_key = self._private_key.public_key()
+
+        # Prevent accidental reuse of the same ephemeral KEX object
+        # for multiple independent sessions.
+        self._session_derived = False
 
     def get_public_bytes(self) -> bytes:
         """
@@ -89,6 +96,7 @@ class EphemeralKeyExchange:
 
         This value is safe to transmit over an untrusted transport.
         """
+
         return self._public_key.public_bytes(
             encoding=serialization.Encoding.Raw,
             format=serialization.PublicFormat.Raw,
@@ -99,6 +107,7 @@ class EphemeralKeyExchange:
         """
         Encode a byte string using a 4-byte big-endian length prefix.
         """
+
         return struct.pack("!I", len(value)) + value
 
     @classmethod
@@ -110,14 +119,15 @@ class EphemeralKeyExchange:
         """
         Build the canonical KEX transcript.
 
-        The role-specific ordering is intentional:
+        The ordering is always:
 
             protocol version
             initiator public key
             responder public key
 
-        This ensures both sides construct exactly the same transcript.
+        Both peers therefore construct exactly the same transcript.
         """
+
         return (
             cls._length_prefix(cls.PROTOCOL_VERSION)
             + cls._length_prefix(initiator_public_bytes)
@@ -135,6 +145,7 @@ class EphemeralKeyExchange:
         """
         HKDF-SHA256 helper.
         """
+
         return HKDF(
             algorithm=hashes.SHA256(),
             length=length,
@@ -142,19 +153,35 @@ class EphemeralKeyExchange:
             info=info,
         ).derive(ikm)
 
-    def derive_session(self, peer_public_bytes: bytes) -> KexResult:
+    def derive_session(
+        self,
+        peer_public_bytes: bytes,
+    ) -> KexResult:
         """
-        Perform the X25519 exchange and derive the complete EBEC session.
+        Perform the X25519 exchange and derive the complete EBEC
+        session root.
 
         Returns:
-            KexResult containing the root secret, session ID,
-            direction-specific keys, and SAS.
 
-        The caller must independently verify the SAS before using
+            KexResult containing:
+
+                root_secret
+                session_id
+                sas
+
+        The caller MUST independently verify the SAS before using
         the resulting session for authenticated communication.
         """
+
+        if self._session_derived:
+            raise RuntimeError(
+                "this ephemeral key exchange has already been used"
+            )
+
         if not isinstance(peer_public_bytes, bytes):
-            raise TypeError("peer_public_bytes must be bytes")
+            raise TypeError(
+                "peer_public_bytes must be bytes"
+            )
 
         if len(peer_public_bytes) != 32:
             raise ValueError(
@@ -167,7 +194,11 @@ class EphemeralKeyExchange:
 
         my_public_bytes = self.get_public_bytes()
 
-        # Determine the canonical initiator/responder public keys.
+        # Determine canonical initiator/responder public keys.
+        #
+        # We intentionally use role-based ordering rather than sorting
+        # the public keys. This makes the transcript explicitly bind
+        # the identity of each ephemeral key to its protocol role.
         if self.role == "initiator":
             initiator_public_bytes = my_public_bytes
             responder_public_bytes = peer_public_bytes
@@ -175,66 +206,77 @@ class EphemeralKeyExchange:
             initiator_public_bytes = peer_public_bytes
             responder_public_bytes = my_public_bytes
 
-        # Build the exact same transcript on both peers.
         transcript = self._build_transcript(
             initiator_public_bytes,
             responder_public_bytes,
         )
 
-        # Perform X25519 ECDH.
-        raw_shared_secret = self._private_key.exchange(peer_public_key)
+        transcript_hash = hashlib.sha256(
+            transcript
+        ).digest()
 
-        # Extract a session master secret from the raw X25519 output.
-        #
-        # The transcript is used as HKDF salt/context material so that
-        # the resulting session is cryptographically bound to these
-        # particular ephemeral public keys.
-        master_secret = self._hkdf(
-            ikm=raw_shared_secret,
-            salt=hashlib.sha256(transcript).digest(),
-            info=b"ebec-kex-master-v1",
-            length=32,
+        # Perform X25519 ECDH.
+        raw_shared_secret = self._private_key.exchange(
+            peer_public_key
         )
 
-        # Derive the root secret independently from the master secret.
+        # Reject an all-zero X25519 shared secret.
+        #
+        # cryptography's X25519 implementation normally handles the
+        # relevant low-order-point behavior, but explicitly checking
+        # the result keeps this protocol invariant visible here.
+        if not any(raw_shared_secret):
+            raise ValueError(
+                "invalid X25519 shared secret"
+            )
+
+        # First derive a session-specific master secret.
+        #
+        # Binding the transcript here means the resulting session
+        # material is tied to this exact pair of ephemeral public keys.
+        master_secret = self._hkdf(
+            ikm=raw_shared_secret,
+            salt=transcript_hash,
+            info=self.MASTER_INFO,
+            length=self.KEY_LENGTH,
+        )
+
+        # Derive the encryption root independently from the master
+        # secret. This gives the encryption layer its own domain.
         root_secret = self._hkdf(
             ikm=master_secret,
             info=self.ROOT_INFO,
             length=self.KEY_LENGTH,
         )
 
-        # Derive a stable 128-bit identifier for this KEX session.
+        # Derive a stable 128-bit session identifier from the same
+        # authenticated session material.
+        #
+        # The session ID is public packet metadata, not a secret.
         session_id = self._hkdf(
             ikm=master_secret,
             info=self.SESSION_ID_INFO,
             length=self.SESSION_ID_LENGTH,
         )
 
-        # Derive independent encryption keys for each direction.
-        initiator_to_responder_key = self._hkdf(
-            ikm=master_secret,
-            info=self.INITIATOR_TO_RESPONDER_INFO,
-            length=self.KEY_LENGTH,
-        )
-
-        responder_to_initiator_key = self._hkdf(
-            ikm=master_secret,
-            info=self.RESPONDER_TO_INITIATOR_INFO,
-            length=self.KEY_LENGTH,
-        )
-
-        # Derive a separate key specifically for SAS authentication.
+        # Derive a completely separate key for SAS generation.
         sas_key = self._hkdf(
             ikm=master_secret,
             info=self.SAS_INFO,
-            length=32,
+            length=self.KEY_LENGTH,
         )
 
         # Authenticate the complete canonical transcript.
         #
-        # HMAC is used here rather than directly hashing the public keys.
-        # This means the SAS depends on both the transcript and the
-        # authenticated shared secret.
+        # The SAS therefore depends on:
+        #
+        #   - the protocol version
+        #   - the initiator ephemeral public key
+        #   - the responder ephemeral public key
+        #   - the X25519 shared secret
+        #
+        # A passive observer cannot reproduce the SAS without the
+        # shared secret.
         sas_mac = hmac.new(
             sas_key,
             transcript,
@@ -244,19 +286,11 @@ class EphemeralKeyExchange:
         # 6 bytes = 48 bits = 12 hexadecimal characters.
         sas = sas_mac[: self.SAS_LENGTH_BYTES].hex().upper()
 
-        # Assign directional keys according to this peer's role.
-        if self.role == "initiator":
-            send_key = initiator_to_responder_key
-            receive_key = responder_to_initiator_key
-        else:
-            send_key = responder_to_initiator_key
-            receive_key = initiator_to_responder_key
+        self._session_derived = True
 
         return KexResult(
             root_secret=root_secret,
             session_id=session_id,
-            send_key=send_key,
-            receive_key=receive_key,
             sas=sas,
         )
 
@@ -272,8 +306,11 @@ class EphemeralKeyExchange:
             (root_secret, sas)
 
         New code should prefer derive_session(), which also provides
-        session ID and direction-specific encryption keys.
+        the session ID required by the packet layer.
         """
-        result = self.derive_session(peer_public_bytes)
+
+        result = self.derive_session(
+            peer_public_bytes
+        )
 
         return result.root_secret, result.sas
