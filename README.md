@@ -65,14 +65,14 @@ print(f"Decryption successful at Unix time {timestamp}: {plaintext_bytes.decode(
 
 ## Architecture
 
-1. Key Derivation (HKDF-SHA256): Per epoch AES-256 keys derived using HKDF-SHA256 where salt is public epoch integer (timestamp // 60)
-and info parameter provides strict domain separation.
+1. Key Derivation (HKDF-SHA256): Per-epoch AES-256 keys derived using HKDF-SHA256 where the salt is the public epoch integer (timestamp // 60) 
+and the info parameter provides strict domain separation.
 
-2. Associated Data (AAD) Binding: Binary header (magic + version + timestamp) is bound directly to AESGCM tag. Tampering with headers
+2. Associated Data (AAD) Binding: The binary header (magic + version + timestamp) is bound directly to the AES-GCM tag. Tampering with headers 
 in transit instantly invalidates the authentication tag.
 
-3. Replay Mitigation: Incoming packets are hashed via SHA-256(packet) and checked against a size capped OrderedDict replay cache,
-pruned for age expiration (Max_Packet_Age = 300s).
+3. Replay & Skew Mitigation: Incoming packets are hashed via SHA-256(packet) and checked against a size-capped OrderedDict replay cache. Includes 
+age expiration (MAX_PACKET_AGE = 300s) and future skew tolerance (MAX_FUTURE_SKEW = 30s).
 
 ## License
 
